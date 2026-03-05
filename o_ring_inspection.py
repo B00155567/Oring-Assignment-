@@ -1,15 +1,21 @@
+"""
+O-ring inspection - checks if rings are broken, have holes, tears, etc.
+"""
 import numpy as np
 import cv2, os, time, glob
 
+# thresholds for deciding if o-ring is bad
 MIN_AREA, FRAGMENT_RATIO = 100, 0.02
 CIRC_MIN, EXTENT_MAX = 0.12, 0.80
 SOL_MID_LOW, SOL_MID_HIGH, SOL_HIGH = 0.744, 0.752, 0.753
 PR_EDGE, CIRC_EDGE = 7.40, 0.20
 
 def compute_histogram(gray):
+    # count how many pixels at each brightness level
     return np.bincount(gray.ravel(), minlength=256)
 
 def otsu_threshold(hist):
+    # find best cutoff to separate foreground from background
     total = np.sum(hist)
     if total == 0:
         return 128
@@ -31,6 +37,7 @@ def otsu_threshold(hist):
 
 
 def _morph(img, k, erode_mode):
+    # erosion or dilation with a square kernel
     h, w, pad = img.shape[0], img.shape[1], k // 2
     padded = np.pad(img, pad, constant_values=0)
     out = np.full_like(img, 255 if erode_mode else 0)
@@ -41,9 +48,11 @@ def _morph(img, k, erode_mode):
     return out
 
 def closing(img, k=3):
+    # dilate then erode - fills small gaps
     return _morph(_morph(img, k, False), k, True)
 
 class UnionFind:
+    # for grouping connected pixels together
     def __init__(self):
         self.p = {}
 
@@ -60,6 +69,7 @@ class UnionFind:
             self.p[px] = py
 
 def connected_components(binary):
+    # label each blob of white pixels with its own id
     h, w = binary.shape
     labelled = np.zeros((h, w), dtype=np.int32)
     uf, label_map, next_lab = UnionFind(), {}, 1
@@ -86,35 +96,41 @@ def connected_components(binary):
     return labelled, regions
 
 def count_holes(mask):
+    # how many holes inside the ring (should be 1 for good o-ring)
     pad = np.pad(mask, 1, constant_values=0)
     inv = 255 - pad
     inv[0, :] = inv[-1, :] = inv[:, 0] = inv[:, -1] = 0
     _, regions = connected_components(inv)
     H, W = inv.shape
-    border = {L for L, pix in regions.items() for i, j in pix if i in (1, H-2) or j in (1, W-2)}
+    border = {L for L, pix in regions.items() for i, j in pix if i in (1, H-2) or j in (1, W-2)}  # holes touching edge don't count
     return max(0, len(regions) - len(border))
 
 def _perim(pixels):
+    # count edge pixels (4-connected)
     if len(pixels) < 10:
         return 0
     ps = set(pixels)
     return sum(1 for i, j in pixels for di, dj in [(-1,0),(1,0),(0,-1),(0,1)] if (i+di,j+dj) not in ps)
 
 def circularity(pixels):
+    # how round is it (1 = perfect circle)
     p = _perim(pixels)
     return 4 * np.pi * len(pixels) / (p ** 2) if p else 0
 
 def perimeter_ratio(pixels):
+    # perimeter / sqrt(area) - catches jagged edges
     p = _perim(pixels)
     return p / np.sqrt(len(pixels)) if p else 0
 
 def extent(pixels):
+    # area / bounding box area - low = C-shaped
     if len(pixels) < 5:
         return 0
     ys, xs = [p[0] for p in pixels], [p[1] for p in pixels]
     return len(pixels) / ((max(ys) - min(ys) + 1) * (max(xs) - min(xs) + 1))
 
 def convex_hull_area(pixels):
+    # area of convex hull (graham scan)
     if len(pixels) < 3:
         return 0
     pset = set(pixels)
@@ -133,16 +149,18 @@ def convex_hull_area(pixels):
     return abs(sum(hull[i][0]*hull[(i+1)%len(hull)][1] - hull[(i+1)%len(hull)][0]*hull[i][1] for i in range(len(hull)))) / 2
 
 def solidity(pixels):
+    # area / hull area - catches tears/notches
     if len(pixels) < 10:
         return 1
     h = convex_hull_area(pixels)
     return len(pixels) / h if h > 0 else 1
 
 def is_defective(mask, regions):
+    # check all the defect rules, return (bad?, reason)
     if not regions:
         return True, "No foreground"
     by_size = sorted(regions.values(), key=len, reverse=True)
-    main = by_size[0]
+    main = by_size[0]  # the main ring blob
     if len(main) < MIN_AREA:
         return True, "Too small"
     my, mx = [p[0] for p in main], [p[1] for p in main]
@@ -157,9 +175,9 @@ def is_defective(mask, regions):
     if frags >= 1:
         return True, f"Broken: {frags + 1} fragments"
     holes = count_holes(mask)
-    if holes == 0:
+    if holes == 0:  # no hole = solid blob, not a ring
         return True, "Broken: gap"
-    if holes >= 2:
+    if holes >= 2:  # multiple holes = chunks missing
         return True, f"Chunks missing: {holes} holes"
     circ, ext, sol = circularity(main), extent(main), solidity(main)
     pr = perimeter_ratio(main)
@@ -174,19 +192,20 @@ def is_defective(mask, regions):
     return False, "OK"
 
 def process(img_path, out_dir=None):
+    # main pipeline: load -> threshold -> segment -> check defects
     img = cv2.imread(img_path)
     if img is None:
         return None, "Load failed", 0
-    gray = (0.299 * img[:, :, 2] + 0.587 * img[:, :, 1] + 0.114 * img[:, :, 0]).astype(np.uint8)
+    gray = (0.299 * img[:, :, 2] + 0.587 * img[:, :, 1] + 0.114 * img[:, :, 0]).astype(np.uint8)  # rgb to grayscale
     t0 = time.perf_counter()
     hist = compute_histogram(gray)
     thresh = otsu_threshold(hist)
     binary = np.where(gray >= thresh, 255, 0).astype(np.uint8)
-    binary = closing(binary)
+    binary = closing(binary)  # clean up noise
     _, regions = connected_components(binary)
     mask = np.zeros_like(binary)
     if regions:
-        main_pix = max(regions.values(), key=len)
+        main_pix = max(regions.values(), key=len)  # biggest blob = the ring
         mask[np.array([p[0] for p in main_pix]), np.array([p[1] for p in main_pix])] = 255
     defective, reason = is_defective(mask, regions)
     result = "FAIL" if defective else "PASS"
@@ -195,7 +214,7 @@ def process(img_path, out_dir=None):
     if len(out.shape) == 2:
         out = np.stack([out] * 3, axis=-1)
     mask3 = np.expand_dims(mask, axis=2).repeat(3, axis=2)
-    out = np.where(mask3 == 255, 0.5 * out + 0.5 * np.array([0, 255, 0]), out).astype(np.uint8)
+    out = np.where(mask3 == 255, 0.5 * out + 0.5 * np.array([0, 255, 0]), out).astype(np.uint8)  # highlight ring in green
     color = (0, 0, 255) if defective else (0, 255, 0)
     cv2.putText(out, f"{result} {elapsed:.0f}ms", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
     cv2.putText(out, reason, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
@@ -205,6 +224,7 @@ def process(img_path, out_dir=None):
     return result, reason, elapsed
 
 def main():
+    # run on all jpgs in Orings folder
     base = os.path.dirname(os.path.abspath(__file__))
     paths = sorted(glob.glob(os.path.join(base, "Orings", "*.jpg")))
     if not paths:
